@@ -4,5 +4,4 @@ Supplementary codes for 'On-Line Policy Iteration with Trajectory-Driven Policy 
 ## Multidimensional Assignment (MDA) Problem 
 
 ![On-Line PI MDA](multidimensional-assignment/On_line_PI_MDA_animation.gif)
-
-Implementation of On-Line PI to MDA: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://drive.google.com/file/d/16R4ndUbE9CKDb_Mnzpp3zanOxsd6IToq/view?usp=sharing)
+Animation of on-line PI applied to MDA. Starting with a randomly generated solution, on-line PI updates the arcs between two frames at each stage. After one iteration, new assignment is obtained.
