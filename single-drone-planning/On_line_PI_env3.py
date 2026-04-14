@@ -1,6 +1,8 @@
 """
 Policy Iteration via Rollout — 3D Drone, Environment 3.
 
+Copyright (c) 2026 Fei Chen
+
 Start: (0.0, -2.5, 2.0)  →  Goal region around (0.0, 2.5, 0.5)
 24 obstacles (box + sphere) dispersed across [-3, 3]^2 x [-0.5, 2.5].
 
@@ -16,8 +18,23 @@ import os
 import sys
 import multiprocessing as mp
 import matplotlib
+# # Detect Colab / Jupyter: they handle display via the inline backend, so don't force Agg.
+# def _in_notebook():
+#     try:
+#         from IPython import get_ipython
+#         shell = get_ipython().__class__.__name__
+#         return shell in ("ZMQInteractiveShell", "Shell", "Colab")
+#     except Exception:
+#         return False
+
+# IN_NOTEBOOK = _in_notebook()
+
+# Prefer interactive backend on local macOS; use Agg only when explicitly headless.
 if os.environ.get("FORCE_HEADLESS", "0") == "1":
     matplotlib.use("Agg")
+# elif IN_NOTEBOOK:
+#     # Let Colab/Jupyter pick its inline backend automatically; do not override.
+#     pass
 elif sys.platform == "darwin":
     try:
         matplotlib.use("MacOSX")
@@ -47,12 +64,18 @@ class Config:
     goal_half_size: np.ndarray = None
     cost_goal_half_size: np.ndarray = None
 
-    lambda_u: float = 0.05
+    lambda_u: float = 0.1
     c_obs: float = 0.3
-    eps_obs: float = 0.01
+    eps_obs: float = 0.05
     alpha_goal: float = 0.5
-    C_p: float = 80.0
+    C_p: float = 40.0
     C_v: float = 10.0
+    # Half-width of the centered control grid used in the rollout coordinate
+    # descent (in acceleration units). Linearly decays from _max at k=0 to
+    # _min at k=N-1: wider trust region early (faster correction of bad base
+    # actions), finer grid late (smooth, wobble-free terminal control).
+    grid_half_width_max: float = 0.6
+    grid_half_width_min: float = 0.1
 
     ppo_total_steps: int = 40_000
     ppo_lr: float = 3e-4
@@ -65,7 +88,7 @@ class Config:
     ppo_entropy_coef: float = 0.01
 
     grid_points: int = 7
-    n_policy_iters: int = 8
+    n_policy_iters: int = 12
 
     nn_hidden: int = 64
     nn_epochs: int = 300
@@ -210,15 +233,23 @@ def stage_cost(x: np.ndarray, u: np.ndarray, cfg: Config) -> float:
     p = x[0:3]
     return (cfg.lambda_u * np.sum(u**2)
             + obstacle_barrier_cost(p, cfg)
-            + goal_attraction_cost(p, cfg))
+            + cfg.alpha_goal * np.sum((p - cfg.goal_center)**2))
 
 
+"""
 def terminal_cost(x: np.ndarray, cfg: Config) -> float:
     p, v = x[0:3], x[3:6]
     dist_sq_cost = goal_cost_dist_sq(p, cfg)
     dist_sq_center = np.sum((p - cfg.goal_center)**2)
     return (cfg.C_p * dist_sq_cost
             + 2.0 * dist_sq_center
+            + cfg.C_v * np.sum(v**2)
+            + obstacle_barrier_cost(p, cfg))
+"""
+def terminal_cost(x: np.ndarray, cfg: Config) -> float:
+    p, v = x[0:3], x[3:6]
+    dist_sq_center = np.sum((p - cfg.goal_center)**2)
+    return (cfg.C_p * dist_sq_center
             + cfg.C_v * np.sum(v**2)
             + obstacle_barrier_cost(p, cfg))
 
@@ -228,6 +259,21 @@ def trajectory_cost(traj, controls, cfg):
     for k in range(len(controls)):
         J += stage_cost(traj[k], controls[k], cfg)
     return J
+
+
+def grid_half_width_at(k, cfg):
+    """Linearly decaying trust region for the rollout coordinate descent.
+
+    delta_k = delta_max + (delta_min - delta_max) * k / (N - 1)
+
+    Wider grid early (k=0 -> grid_half_width_max) speeds correction of bad
+    base actions; finer grid late (k=N-1 -> grid_half_width_min) gives
+    high-resolution terminal control and prevents tail wobble.
+    """
+    if cfg.N <= 1:
+        return cfg.grid_half_width_min
+    frac = k / (cfg.N - 1)
+    return cfg.grid_half_width_max + (cfg.grid_half_width_min - cfg.grid_half_width_max) * frac
 
 
 # ======================================================================
@@ -498,7 +544,10 @@ def _pack_policy_for_workers(policy, cfg):
         'cost_goal_half_size': cfg.cost_goal_half_size.copy(),
         'lambda_u': cfg.lambda_u, 'c_obs': cfg.c_obs, 'eps_obs': cfg.eps_obs,
         'alpha_goal': cfg.alpha_goal, 'C_p': cfg.C_p, 'C_v': cfg.C_v,
-        'grid_points': cfg.grid_points, 'n_policy_iters': cfg.n_policy_iters,
+        'grid_points': cfg.grid_points,
+        'grid_half_width_max': cfg.grid_half_width_max,
+        'grid_half_width_min': cfg.grid_half_width_min,
+        'n_policy_iters': cfg.n_policy_iters,
         'nn_hidden': cfg.nn_hidden, 'nn_epochs': cfg.nn_epochs, 'nn_lr': cfg.nn_lr,
         'nn_batch': cfg.nn_batch, 'nn_perturb_samples': cfg.nn_perturb_samples,
         'ppo_total_steps': cfg.ppo_total_steps, 'ppo_lr': cfg.ppo_lr,
@@ -510,13 +559,15 @@ def _pack_policy_for_workers(policy, cfg):
 
 
 N_WORKERS = 7
-USE_PARALLEL = 0          # 0 = serial (single-process), 1 = parallel (multiprocess)
+USE_PARALLEL = 1          # 0 = serial (single-process), 1 = parallel (multiprocess)
 
 
 def run_rollout_iteration(policy, cfg):
     u_min = np.array([-cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z])
     u_max = np.array([cfg.A_MAX_XY, cfg.A_MAX_XY, cfg.A_MAX_Z])
-    grid_vals = [np.linspace(u_min[d], u_max[d], cfg.grid_points) for d in range(3)]
+    # Note: the grid is now built per-step, centered on u_base, inside the k-loop.
+    # This implements the centered-grid construction from Eq. 31 of the paper
+    # and prevents tail wobble caused by a coarse full-range grid.
 
     pool = None
     if USE_PARALLEL:
@@ -535,6 +586,19 @@ def run_rollout_iteration(policy, cfg):
         u_base = policy.get_action(x, k)
         best_u = u_base.copy()
         best_J = _eval_tail_cost_nn(x, u_base, k, policy, cfg)
+
+        # Build a centered grid around u_base for this step, clipped to
+        # the actuator box. Half-width decays linearly with k from
+        # grid_half_width_max (at k=0) to grid_half_width_min (at k=N-1).
+        hw = grid_half_width_at(k, cfg)
+        grid_vals = []
+        for d in range(3):
+            lo = max(u_min[d], u_base[d] - hw)
+            hi = min(u_max[d], u_base[d] + hw)
+            if hi <= lo:
+                lo, hi = u_min[d], u_max[d]
+            grid_vals.append(np.linspace(lo, hi, cfg.grid_points))
+
         cur = u_base.copy()
         for dim in range(3):
             cands = []
@@ -633,8 +697,8 @@ def draw_sphere_3d(ax, center, radius, color='red', alpha=0.2):
 # ======================================================================
 def main():
     cfg = Config()
-    np.random.seed(7)
-    torch.manual_seed(7)
+    np.random.seed(123)
+    torch.manual_seed(123)
 
     print("=" * 70)
     print("Policy Iteration via Rollout — 3D Drone (Env 3)")
@@ -823,8 +887,17 @@ def main():
 
     fig1.tight_layout()
     fig2.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
-    plt.show()
 
+    # # Always save figures to disk so they are accessible on Colab / headless runs. ---- uncomment for saving figures
+    # out_dir = os.environ.get("FIG_OUT_DIR", ".")
+    # os.makedirs(out_dir, exist_ok=True)
+    # fig1_path = os.path.join(out_dir, "one_drone_env3_cost.pdf")
+    # fig2_path = os.path.join(out_dir, "one_drone_env3_trajectory.pdf")
+    # fig1.savefig(fig1_path, dpi=150, bbox_inches="tight")
+    # fig2.savefig(fig2_path, dpi=150, bbox_inches="tight")
+    # print(f"[figures] saved:\n  {fig1_path}\n  {fig2_path}")
+
+    plt.show()
 
 if __name__ == "__main__":
     main()

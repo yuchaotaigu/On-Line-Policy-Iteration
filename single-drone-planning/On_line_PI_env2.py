@@ -1,13 +1,11 @@
 """
-Policy Iteration via Rollout — Multi-Agent (2 Drones), Env 1 obstacles.
+Policy Iteration via Rollout — 3D Drone, Environment 2.
 
-Joint state: [p1(3), v1(3), p2(3), v2(3)] = 12D
-Joint control: [a1(3), a2(3)] = 6D
-Same 12 static obstacles as env1, plus inter-agent repulsion.
+Copyright (c) 2026 Fei Chen
 
-Drone 1: (-2, -2, 0) → goal (2, 2, 1)
-Drone 2: (2, -2, 0.5) → goal (-2, 2, 0.5)
-Trajectories designed to cross near the center.
+Different initial position, goal, and denser obstacle field compared to env1.
+Start: (-2.5, 1.5, 1.8)  →  Goal region around (2.5, -1.5, 0.3)
+16 obstacles (box + sphere) dispersed across [-3, 3]^2 x [-0.5, 2.5].
 
 Requirements: numpy, torch, matplotlib
 """
@@ -20,10 +18,24 @@ import torch.optim as optim
 import os
 import sys
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
 import matplotlib
+# # Detect Colab / Jupyter: they handle display via the inline backend, so don't force Agg.
+# def _in_notebook():
+#     try:
+#         from IPython import get_ipython
+#         shell = get_ipython().__class__.__name__
+#         return shell in ("ZMQInteractiveShell", "Shell", "Colab")
+#     except Exception:
+#         return False
+
+# IN_NOTEBOOK = _in_notebook()
+
+# Prefer interactive backend on local macOS; use Agg only when explicitly headless.
 if os.environ.get("FORCE_HEADLESS", "0") == "1":
     matplotlib.use("Agg")
+# elif IN_NOTEBOOK:
+#     # Let Colab/Jupyter pick its inline backend automatically; do not override.
+#     pass
 elif sys.platform == "darwin":
     try:
         matplotlib.use("MacOSX")
@@ -48,27 +60,27 @@ class Config:
     A_MAX_XY: float = 3.0
     A_MAX_Z: float = 3.5
 
-    x0_agent1: np.ndarray = None
-    x0_agent2: np.ndarray = None
-    goal1_center: np.ndarray = None
-    goal2_center: np.ndarray = None
+    x0: np.ndarray = None
+    goal_center: np.ndarray = None
     goal_half_size: np.ndarray = None
     cost_goal_half_size: np.ndarray = None
 
-    lambda_u: float = 0.05
+    lambda_u: float = 0.1
     c_obs: float = 0.3
-    eps_obs: float = 0.01
+    eps_obs: float = 0.05
     alpha_goal: float = 0.5
-    C_p: float = 80.0
+    C_p: float = 40.0
     C_v: float = 10.0
+    # Half-width of the centered control grid used in the rollout coordinate
+    # descent (in acceleration units). Linearly decays from _max at k=0 to
+    # _min at k=N-1: wider trust region early (faster correction of bad base
+    # actions), finer grid late (smooth, wobble-free terminal control).
+    grid_half_width_max: float = 0.5
+    grid_half_width_min: float = 0.1
 
-    c_inter: float = 0.8
-    eps_inter: float = 0.02
-    safe_radius: float = 0.4
-
-    ppo_total_steps: int = 100_000
+    ppo_total_steps: int = 20_000
     ppo_lr: float = 3e-4
-    ppo_hidden: int = 128
+    ppo_hidden: int = 64
     ppo_gamma: float = 1.0
     ppo_lam: float = 0.95
     ppo_clip_eps: float = 0.2
@@ -77,48 +89,40 @@ class Config:
     ppo_entropy_coef: float = 0.01
 
     grid_points: int = 7
-    n_policy_iters: int = 16
+    n_policy_iters: int = 12
 
-    nn_hidden: int = 128
+    nn_hidden: int = 64
     nn_epochs: int = 300
     nn_lr: float = 1e-3
     nn_batch: int = 128
-    nn_perturb_samples: int = 600
+    nn_perturb_samples: int = 500
 
     def __post_init__(self):
-        if self.x0_agent1 is None:
-            self.x0_agent1 = np.array([-2.0, -2.0, 0.0, 0, 0, 0], float)
-        if self.x0_agent2 is None:
-            self.x0_agent2 = np.array([2.0, -2.0, 0.5, 0, 0, 0], float)
-        if self.goal1_center is None:
-            self.goal1_center = np.array([2.0, 2.0, 1.0], float)
-        if self.goal2_center is None:
-            self.goal2_center = np.array([-2.0, 2.0, 0.5], float)
+        if self.x0 is None:
+            self.x0 = np.array([-2.5, 1.5, 1.8, 0, 0, 0, 0, 0, 0, 0, 0, 0], float)
+        if self.goal_center is None:
+            self.goal_center = np.array([2.5, -1.5, 0.3], float)
         if self.goal_half_size is None:
             self.goal_half_size = np.array([0.55, 0.55, 0.55], float)
         if self.cost_goal_half_size is None:
             self.cost_goal_half_size = np.array([0.1, 0.1, 0.1], float)
 
-    @property
-    def x0(self):
-        return np.concatenate([self.x0_agent1, self.x0_agent2])
-
 
 # ======================================================================
-# Obstacles (same 12 as env1)
+# Obstacles — 16 total, dispersed across [-3,3]^2 x [-0.5, 2.5]
 # ======================================================================
 @dataclass
 class BoxObstacle:
     center: np.ndarray
     half_size: np.ndarray
 
-    def surface_dist_sq(self, p):
+    def surface_dist_sq(self, p: np.ndarray) -> float:
         d = np.abs(p - self.center) - self.half_size
         if np.all(d < 0):
             return 0.0
         return np.sum(np.maximum(d, 0.0)**2)
 
-    def barrier(self, p, c, eps):
+    def barrier(self, p: np.ndarray, c: float, eps: float) -> float:
         return c / (self.surface_dist_sq(p) + eps)
 
 
@@ -127,113 +131,118 @@ class SphereObstacle:
     center: np.ndarray
     radius: float
 
-    def surface_dist_sq(self, p):
+    def surface_dist_sq(self, p: np.ndarray) -> float:
         d = np.linalg.norm(p - self.center) - self.radius
         if d <= 0:
             return 0.0
         return d**2
 
-    def barrier(self, p, c, eps):
+    def barrier(self, p: np.ndarray, c: float, eps: float) -> float:
         return c / (self.surface_dist_sq(p) + eps)
 
 
 def build_obstacles():
+    """16 obstacles spread across the workspace for env2."""
     return [
-        BoxObstacle(center=np.array([-1.2, -0.8, 0.2]), half_size=np.array([0.25, 0.3, 0.3])),
-        SphereObstacle(center=np.array([-0.5, -1.5, 0.5]), radius=0.3),
-        SphereObstacle(center=np.array([0.0, 0.3, 0.0]), radius=0.35),
-        BoxObstacle(center=np.array([0.5, -0.5, 0.8]), half_size=np.array([0.3, 0.25, 0.25])),
-        SphereObstacle(center=np.array([-0.8, 1.0, 0.4]), radius=0.28),
-        BoxObstacle(center=np.array([1.2, 0.5, 0.3]), half_size=np.array([0.2, 0.3, 0.35])),
-        SphereObstacle(center=np.array([0.3, 1.5, 1.0]), radius=0.25),
-        SphereObstacle(center=np.array([1.5, 1.8, 0.6]), radius=0.3),
-        BoxObstacle(center=np.array([-1.5, 0.5, 0.8]), half_size=np.array([0.2, 0.2, 0.3])),
-        SphereObstacle(center=np.array([1.0, -1.0, 0.2]), radius=0.22),
-        BoxObstacle(center=np.array([0.8, 0.8, 1.2]), half_size=np.array([0.2, 0.2, 0.2])),
-        SphereObstacle(center=np.array([-0.3, -0.3, 1.0]), radius=0.2),
+        # Near start region (top-left, high z)
+        SphereObstacle(center=np.array([-1.8, 1.0, 1.5]), radius=0.28),
+        BoxObstacle(center=np.array([-1.2, 0.5, 1.8]), half_size=np.array([0.2, 0.25, 0.2])),
+        # Upper-left corridor
+        SphereObstacle(center=np.array([-2.0, -0.3, 1.2]), radius=0.25),
+        BoxObstacle(center=np.array([-0.5, 1.2, 0.8]), half_size=np.array([0.3, 0.2, 0.25])),
+        # Center field
+        SphereObstacle(center=np.array([0.0, 0.0, 1.0]), radius=0.35),
+        BoxObstacle(center=np.array([0.3, -0.5, 0.5]), half_size=np.array([0.25, 0.3, 0.3])),
+        SphereObstacle(center=np.array([-0.8, -0.8, 0.3]), radius=0.22),
+        BoxObstacle(center=np.array([0.8, 0.6, 1.4]), half_size=np.array([0.2, 0.2, 0.25])),
+        # Right side
+        SphereObstacle(center=np.array([1.5, 0.0, 0.8]), radius=0.30),
+        BoxObstacle(center=np.array([1.0, -1.0, 0.2]), half_size=np.array([0.25, 0.25, 0.2])),
+        SphereObstacle(center=np.array([2.0, 0.8, 0.5]), radius=0.25),
+        # Near goal region (bottom-right, low z)
+        BoxObstacle(center=np.array([1.8, -1.2, 0.6]), half_size=np.array([0.2, 0.3, 0.25])),
+        SphereObstacle(center=np.array([2.2, -0.5, 0.1]), radius=0.22),
+        BoxObstacle(center=np.array([0.5, -1.8, 0.8]), half_size=np.array([0.3, 0.2, 0.2])),
+        # Scattered extras
+        SphereObstacle(center=np.array([-1.5, -1.5, 0.5]), radius=0.26),
+        BoxObstacle(center=np.array([-0.3, 0.8, 2.0]), half_size=np.array([0.2, 0.2, 0.2])),
     ]
 
 
 OBSTACLES = build_obstacles()
 
+
 # ======================================================================
-# Joint dynamics: x = [p1(3), v1(3), p2(3), v2(3)], u = [a1(3), a2(3)]
+# Dynamics
 # ======================================================================
-def step_single(p, v, a, cfg):
-    a = a.copy()
+def step_dynamics(x: np.ndarray, u: np.ndarray, cfg: Config) -> np.ndarray:
+    x = x.copy()
+    x[3:6] = np.clip(x[3:6], -cfg.V_MAX, cfg.V_MAX)
+    p, v = x[0:3], x[3:6]
+    a = np.array(u, float).ravel()[:3]
     a[0:2] = np.clip(a[0:2], -cfg.A_MAX_XY, cfg.A_MAX_XY)
     a[2] = np.clip(a[2], -cfg.A_MAX_Z, cfg.A_MAX_Z)
-    v = np.clip(v, -cfg.V_MAX, cfg.V_MAX)
-    pn = p + cfg.dt * v + 0.5 * cfg.dt**2 * a
-    vn = np.clip(v + cfg.dt * a, -cfg.V_MAX, cfg.V_MAX)
-    return pn, vn
+    xn = x.copy()
+    xn[0:3] = p + cfg.dt * v + 0.5 * cfg.dt**2 * a
+    xn[3:6] = np.clip(v + cfg.dt * a, -cfg.V_MAX, cfg.V_MAX)
+    xn[6:12] = 0.0
+    return xn
 
 
-def step_dynamics(x, u, cfg):
-    p1, v1, p2, v2 = x[0:3], x[3:6], x[6:9], x[9:12]
-    a1, a2 = np.array(u[:3], float), np.array(u[3:6], float)
-    p1n, v1n = step_single(p1, v1, a1, cfg)
-    p2n, v2n = step_single(p2, v2, a2, cfg)
-    return np.concatenate([p1n, v1n, p2n, v2n])
-
-
-def clamp_control(u, cfg):
-    u = np.array(u, float).ravel()[:6]
+def clamp_control(u: np.ndarray, cfg: Config) -> np.ndarray:
+    u = np.array(u, float).ravel()[:3]
     u[0:2] = np.clip(u[0:2], -cfg.A_MAX_XY, cfg.A_MAX_XY)
     u[2] = np.clip(u[2], -cfg.A_MAX_Z, cfg.A_MAX_Z)
-    u[3:5] = np.clip(u[3:5], -cfg.A_MAX_XY, cfg.A_MAX_XY)
-    u[5] = np.clip(u[5], -cfg.A_MAX_Z, cfg.A_MAX_Z)
     return u
 
 
 # ======================================================================
 # Cost
 # ======================================================================
-def obstacle_barrier_cost_single(p, cfg):
+def obstacle_barrier_cost(p: np.ndarray, cfg: Config) -> float:
     total = 0.0
     for obs in OBSTACLES:
         total += obs.barrier(p, cfg.c_obs, cfg.eps_obs)
     return total
 
 
-def inter_agent_barrier(p1, p2, cfg):
-    d = np.linalg.norm(p1 - p2) - cfg.safe_radius
-    if d <= 0:
-        dist_sq = 0.0
-    else:
-        dist_sq = d**2
-    return cfg.c_inter / (dist_sq + cfg.eps_inter)
-
-
-def goal_region_dist_sq(p, goal_center, goal_half_size):
-    d = np.abs(p - goal_center) - goal_half_size
+def goal_region_dist_sq(p: np.ndarray, cfg: Config) -> float:
+    d = np.abs(p - cfg.goal_center) - cfg.goal_half_size
     return np.sum(np.maximum(d, 0.0)**2)
 
 
-def stage_cost(x, u, cfg):
-    p1, p2 = x[0:3], x[6:9]
-    a1, a2 = u[:3], u[3:6]
-    cost = cfg.lambda_u * (np.sum(a1**2) + np.sum(a2**2))
-    cost += obstacle_barrier_cost_single(p1, cfg) + obstacle_barrier_cost_single(p2, cfg)
-    cost += cfg.alpha_goal * goal_region_dist_sq(p1, cfg.goal1_center, cfg.cost_goal_half_size)
-    cost += cfg.alpha_goal * goal_region_dist_sq(p2, cfg.goal2_center, cfg.cost_goal_half_size)
-    cost += inter_agent_barrier(p1, p2, cfg)
-    return cost
+def goal_cost_dist_sq(p: np.ndarray, cfg: Config) -> float:
+    d = np.abs(p - cfg.goal_center) - cfg.cost_goal_half_size
+    return np.sum(np.maximum(d, 0.0)**2)
 
 
-def terminal_cost(x, cfg):
-    p1, v1, p2, v2 = x[0:3], x[3:6], x[6:9], x[9:12]
-    cost = 0.0
-    cost += cfg.C_p * goal_region_dist_sq(p1, cfg.goal1_center, cfg.cost_goal_half_size)
-    cost += 2.0 * np.sum((p1 - cfg.goal1_center)**2)
-    cost += cfg.C_v * np.sum(v1**2)
-    cost += obstacle_barrier_cost_single(p1, cfg)
-    cost += cfg.C_p * goal_region_dist_sq(p2, cfg.goal2_center, cfg.cost_goal_half_size)
-    cost += 2.0 * np.sum((p2 - cfg.goal2_center)**2)
-    cost += cfg.C_v * np.sum(v2**2)
-    cost += obstacle_barrier_cost_single(p2, cfg)
-    cost += inter_agent_barrier(p1, p2, cfg)
-    return cost
+def goal_attraction_cost(p: np.ndarray, cfg: Config) -> float:
+    return cfg.alpha_goal * goal_cost_dist_sq(p, cfg)
+
+
+def stage_cost(x: np.ndarray, u: np.ndarray, cfg: Config) -> float:
+    p = x[0:3]
+    return (cfg.lambda_u * np.sum(u**2)
+            + obstacle_barrier_cost(p, cfg)
+            + cfg.alpha_goal * np.sum((p - cfg.goal_center)**2))
+
+
+"""
+def terminal_cost(x: np.ndarray, cfg: Config) -> float:
+    p, v = x[0:3], x[3:6]
+    dist_sq_cost = goal_cost_dist_sq(p, cfg)
+    dist_sq_center = np.sum((p - cfg.goal_center)**2)
+    return (cfg.C_p * dist_sq_cost
+            + 2.0 * dist_sq_center
+            + cfg.C_v * np.sum(v**2)
+            + obstacle_barrier_cost(p, cfg))
+"""
+def terminal_cost(x: np.ndarray, cfg: Config) -> float:
+    p, v = x[0:3], x[3:6]
+    dist_sq_center = np.sum((p - cfg.goal_center)**2)
+    return (cfg.C_p * dist_sq_center
+            + cfg.C_v * np.sum(v**2)
+            + obstacle_barrier_cost(p, cfg))
 
 
 def trajectory_cost(traj, controls, cfg):
@@ -243,8 +252,23 @@ def trajectory_cost(traj, controls, cfg):
     return J
 
 
+def grid_half_width_at(k, cfg):
+    """Linearly decaying trust region for the rollout coordinate descent.
+
+    delta_k = delta_max + (delta_min - delta_max) * k / (N - 1)
+
+    Wider grid early (k=0 -> grid_half_width_max) speeds correction of bad
+    base actions; finer grid late (k=N-1 -> grid_half_width_min) gives
+    high-resolution terminal control and prevents tail wobble.
+    """
+    if cfg.N <= 1:
+        return cfg.grid_half_width_min
+    frac = k / (cfg.N - 1)
+    return cfg.grid_half_width_max + (cfg.grid_half_width_min - cfg.grid_half_width_max) * frac
+
+
 # ======================================================================
-# PPO (joint policy for both agents)
+# PPO
 # ======================================================================
 class PPOPolicy(nn.Module):
     def __init__(self, state_dim, action_dim, hidden):
@@ -266,7 +290,7 @@ class PPOPolicy(nn.Module):
 
     def act(self, x_np, cfg, deterministic=False):
         with torch.no_grad():
-            x_t = torch.tensor(x_np[:12], dtype=torch.float32).unsqueeze(0)
+            x_t = torch.tensor(x_np[:6], dtype=torch.float32).unsqueeze(0)
             mu = self.mu(x_t).squeeze(0)
             std = torch.exp(self.log_std)
             if deterministic:
@@ -280,10 +304,9 @@ class PPOPolicy(nn.Module):
 
 
 def rollout_policy_fn(action_fn, cfg):
-    x0 = cfg.x0.copy()
-    traj = [x0.copy()]
+    traj = [cfg.x0.copy()]
     controls = []
-    x = x0.copy()
+    x = cfg.x0.copy()
     for k in range(cfg.N):
         u = clamp_control(action_fn(x, k), cfg)
         controls.append(u.copy())
@@ -293,10 +316,8 @@ def rollout_policy_fn(action_fn, cfg):
 
 
 def train_ppo(cfg):
-    print("[PPO] Training joint initial policy (clipped surrogate)...")
-    state_dim = 12
-    action_dim = 6
-    policy = PPOPolicy(state_dim, action_dim, cfg.ppo_hidden)
+    print("[PPO] Training initial policy (clipped surrogate)...")
+    policy = PPOPolicy(6, 3, cfg.ppo_hidden)
     optimizer = optim.Adam(policy.parameters(), lr=cfg.ppo_lr)
     best_cost = float('inf')
     best_weights = None
@@ -311,7 +332,7 @@ def train_ppo(cfg):
             x = cfg.x0.copy()
             ep_s, ep_a, ep_lp, ep_r, ep_v = [], [], [], [], []
             for k in range(cfg.N):
-                s = x[:12].copy()
+                s = x[:6].copy()
                 a_np, logp, v = policy.act(x, cfg, deterministic=False)
                 r = -stage_cost(x, a_np, cfg)
                 ep_s.append(s); ep_a.append(a_np.copy())
@@ -376,10 +397,10 @@ def train_ppo(cfg):
 
 
 # ======================================================================
-# Residual NN: 12D state deviation + k/N → 6D control correction
+# Residual NN with centering
 # ======================================================================
 class ResidualNN(nn.Module):
-    def __init__(self, state_dim=12, action_dim=6, hidden=128):
+    def __init__(self, state_dim=6, action_dim=3, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + 1, hidden), nn.Tanh(),
@@ -406,11 +427,11 @@ class PolicyWithTrajectory:
 
     def get_action(self, x, k):
         if k < 0 or k >= self.N:
-            return np.zeros(6)
+            return np.zeros(3)
         u_ff = self.ref_controls[k]
         if self.residual_nn is None:
             return clamp_control(u_ff, self.cfg)
-        dx = x[:12] - self.ref_traj[k][:12]
+        dx = x[:6] - self.ref_traj[k][:6]
         with torch.no_grad():
             dx_t = torch.tensor(dx, dtype=torch.float32).unsqueeze(0)
             k_norm = torch.tensor([[k / self.N]], dtype=torch.float32)
@@ -421,20 +442,17 @@ class PolicyWithTrajectory:
 def generate_perturbation_data(ref_traj, ref_controls, cfg):
     data = []
     N = len(ref_controls)
-    u_min = np.array([-cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z,
-                       -cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z])
-    u_max = -u_min
+    u_min = np.array([-cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z])
+    u_max = np.array([cfg.A_MAX_XY, cfg.A_MAX_XY, cfg.A_MAX_Z])
     for _ in range(cfg.nn_perturb_samples):
         k = np.random.randint(0, N)
         x_pert = ref_traj[k].copy()
         x_pert[0:3] += np.random.randn(3) * 0.3
         x_pert[3:6] += np.random.randn(3) * 0.2
-        x_pert[6:9] += np.random.randn(3) * 0.3
-        x_pert[9:12] += np.random.randn(3) * 0.2
         best_u = ref_controls[k].copy()
         best_J = _eval_cost_to_go_stored(x_pert, best_u, k, ref_controls, cfg)
-        for _ in range(15):
-            u_cand = np.clip(ref_controls[k] + np.random.randn(6) * 0.5, u_min, u_max)
+        for _ in range(10):
+            u_cand = np.clip(ref_controls[k] + np.random.randn(3) * 0.5, u_min, u_max)
             J_cand = _eval_cost_to_go_stored(x_pert, u_cand, k, ref_controls, cfg)
             if J_cand < best_J:
                 best_J = J_cand; best_u = u_cand.copy()
@@ -453,14 +471,14 @@ def _eval_cost_to_go_stored(x, u_first, k, ref_controls, cfg):
 
 
 def train_residual_nn(ref_traj, ref_controls, extra_data, cfg):
-    nn_model = ResidualNN(state_dim=12, action_dim=6, hidden=cfg.nn_hidden)
+    nn_model = ResidualNN(state_dim=6, action_dim=3, hidden=cfg.nn_hidden)
     optimizer = optim.Adam(nn_model.parameters(), lr=cfg.nn_lr)
     N = len(ref_controls)
     dx_list, du_list = [], []
     for x_actual, u_target, k in extra_data:
         if k >= N:
             continue
-        dx = x_actual[:12] - ref_traj[k][:12]
+        dx = x_actual[:6] - ref_traj[k][:6]
         du = u_target - ref_controls[k]
         dx_list.append(np.append(dx, k / N))
         du_list.append(du)
@@ -473,7 +491,7 @@ def train_residual_nn(ref_traj, ref_controls, extra_data, cfg):
     nn_model.train()
     for _ in range(cfg.nn_epochs):
         for batch_dx, batch_du in loader:
-            pred = nn_model(batch_dx[:, :12], batch_dx[:, 12:13])
+            pred = nn_model(batch_dx[:, :6], batch_dx[:, 6:7])
             loss = nn.functional.mse_loss(pred, batch_du)
             optimizer.zero_grad(); loss.backward(); optimizer.step()
     nn_model.eval()
@@ -481,20 +499,15 @@ def train_residual_nn(ref_traj, ref_controls, extra_data, cfg):
 
 
 # ======================================================================
-# Rollout: 6D coordinate descent with parallel grid evaluation
+# Rollout with NN policy tail
 # ======================================================================
-_worker_policy = None
-_worker_cfg = None
-
-
 def _init_worker(ref_traj_np, ref_controls_np, nn_state_dict, nn_hidden, cfg_dict):
-    """Initialize per-worker policy object (called once per process)."""
     global _worker_policy, _worker_cfg
     _worker_cfg = Config(**cfg_dict)
     ref_traj = [ref_traj_np[i] for i in range(len(ref_traj_np))]
     ref_controls = [ref_controls_np[i] for i in range(len(ref_controls_np))]
     if nn_state_dict is not None:
-        rnn = ResidualNN(state_dim=12, action_dim=6, hidden=nn_hidden)
+        rnn = ResidualNN(state_dim=6, action_dim=3, hidden=nn_hidden)
         rnn.load_state_dict(nn_state_dict)
         rnn.eval()
     else:
@@ -503,19 +516,11 @@ def _init_worker(ref_traj_np, ref_controls_np, nn_state_dict, nn_hidden, cfg_dic
 
 
 def _eval_candidate(args):
-    """Worker: evaluate one candidate control, return cost."""
     x, u_cand, k = args
     return _eval_tail_cost_nn(x, u_cand, k, _worker_policy, _worker_cfg)
 
 
-def _eval_candidate_batch(args):
-    """Worker: evaluate a batch of candidate controls, return list of costs."""
-    x, u_list, k = args
-    return [_eval_tail_cost_nn(x, u, k, _worker_policy, _worker_cfg) for u in u_list]
-
-
 def _pack_policy_for_workers(policy, cfg):
-    """Serialize policy + cfg into picklable objects for worker init."""
     ref_traj_np = np.array(policy.ref_traj)
     ref_controls_np = np.array(policy.ref_controls)
     nn_sd = None
@@ -525,14 +530,15 @@ def _pack_policy_for_workers(policy, cfg):
     cfg_dict = {
         'dt': cfg.dt, 'N': cfg.N, 'V_MAX': cfg.V_MAX,
         'A_MAX_XY': cfg.A_MAX_XY, 'A_MAX_Z': cfg.A_MAX_Z,
-        'x0_agent1': cfg.x0_agent1.copy(), 'x0_agent2': cfg.x0_agent2.copy(),
-        'goal1_center': cfg.goal1_center.copy(), 'goal2_center': cfg.goal2_center.copy(),
+        'x0': cfg.x0.copy(), 'goal_center': cfg.goal_center.copy(),
         'goal_half_size': cfg.goal_half_size.copy(),
         'cost_goal_half_size': cfg.cost_goal_half_size.copy(),
         'lambda_u': cfg.lambda_u, 'c_obs': cfg.c_obs, 'eps_obs': cfg.eps_obs,
         'alpha_goal': cfg.alpha_goal, 'C_p': cfg.C_p, 'C_v': cfg.C_v,
-        'c_inter': cfg.c_inter, 'eps_inter': cfg.eps_inter, 'safe_radius': cfg.safe_radius,
-        'grid_points': cfg.grid_points, 'n_policy_iters': cfg.n_policy_iters,
+        'grid_points': cfg.grid_points,
+        'grid_half_width_max': cfg.grid_half_width_max,
+        'grid_half_width_min': cfg.grid_half_width_min,
+        'n_policy_iters': cfg.n_policy_iters,
         'nn_hidden': cfg.nn_hidden, 'nn_epochs': cfg.nn_epochs, 'nn_lr': cfg.nn_lr,
         'nn_batch': cfg.nn_batch, 'nn_perturb_samples': cfg.nn_perturb_samples,
         'ppo_total_steps': cfg.ppo_total_steps, 'ppo_lr': cfg.ppo_lr,
@@ -544,21 +550,21 @@ def _pack_policy_for_workers(policy, cfg):
 
 
 N_WORKERS = 7
+USE_PARALLEL = 1          # 0 = serial (single-process), 1 = parallel (multiprocess)
 
 
 def run_rollout_iteration(policy, cfg):
-    u_min = np.array([-cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z,
-                       -cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z])
-    u_max = -u_min
-    grid_vals = []
-    for d in range(6):
-        grid_vals.append(np.linspace(u_min[d], u_max[d], cfg.grid_points))
+    u_min = np.array([-cfg.A_MAX_XY, -cfg.A_MAX_XY, -cfg.A_MAX_Z])
+    u_max = np.array([cfg.A_MAX_XY, cfg.A_MAX_XY, cfg.A_MAX_Z])
+    # Note: the grid is now built per-step, centered on u_base, inside the k-loop.
+    # This implements the centered-grid construction from Eq. 31 of the paper
+    # and prevents tail wobble caused by a coarse full-range grid.
 
-    init_args = _pack_policy_for_workers(policy, cfg)
-    pool = mp.Pool(processes=N_WORKERS, initializer=_init_worker, initargs=init_args)
-
-    # Warmup: ensure all worker processes are spawned before timing starts
-    pool.map(_eval_candidate, [(cfg.x0, np.zeros(6), 0)] * N_WORKERS)
+    pool = None
+    if USE_PARALLEL:
+        init_args = _pack_policy_for_workers(policy, cfg)
+        pool = mp.Pool(processes=N_WORKERS, initializer=_init_worker, initargs=init_args)
+        pool.map(_eval_candidate, [(cfg.x0, np.zeros(3), 0)] * N_WORKERS)
 
     traj = [cfg.x0.copy()]
     controls = []
@@ -566,39 +572,47 @@ def run_rollout_iteration(policy, cfg):
     per_step_times = []
     t_total = time.perf_counter()
     x = cfg.x0.copy()
-
     for k in range(cfg.N):
         t_step = time.perf_counter()
         u_base = policy.get_action(x, k)
         best_u = u_base.copy()
         best_J = _eval_tail_cost_nn(x, u_base, k, policy, cfg)
-        cur = u_base.copy()
 
-        for dim in range(6):
+        # Build a centered grid around u_base for this step, clipped to
+        # the actuator box. Half-width decays linearly with k from
+        # grid_half_width_max (at k=0) to grid_half_width_min (at k=N-1).
+        hw = grid_half_width_at(k, cfg)
+        grid_vals = []
+        for d in range(3):
+            lo = max(u_min[d], u_base[d] - hw)
+            hi = min(u_max[d], u_base[d] + hw)
+            if hi <= lo:
+                lo, hi = u_min[d], u_max[d]
+            grid_vals.append(np.linspace(lo, hi, cfg.grid_points))
+
+        cur = u_base.copy()
+        for dim in range(3):
             cands = []
             for val in grid_vals[dim]:
                 cand = cur.copy(); cand[dim] = float(val)
                 cands.append(clamp_control(cand, cfg))
-
-            # 7 candidates → 7 workers in parallel, one pool.map call
-            tasks = [(x.copy(), c, k) for c in cands]
-            costs = pool.map(_eval_candidate, tasks)
-
+            if USE_PARALLEL:
+                tasks = [(x.copy(), c, k) for c in cands]
+                costs = pool.map(_eval_candidate, tasks)
+            else:
+                costs = [_eval_tail_cost_nn(x, c, k, policy, cfg) for c in cands]
             for idx, J_cand in enumerate(costs):
                 if J_cand < best_J - 1e-12:
-                    best_J = J_cand
-                    best_u = cands[idx].copy()
-                    cur = cands[idx].copy()
-
+                    best_J = J_cand; best_u = cands[idx].copy(); cur = cands[idx].copy()
         if not np.allclose(best_u, u_base, atol=1e-8):
             n_improved += 1
         per_step_times.append(time.perf_counter() - t_step)
         controls.append(best_u.copy())
         x = step_dynamics(x, best_u, cfg)
         traj.append(x.copy())
-
-    pool.close()
-    pool.join()
+    if pool is not None:
+        pool.close()
+        pool.join()
     elapsed = time.perf_counter() - t_total
     return traj, controls, n_improved, per_step_times, elapsed
 
@@ -625,7 +639,7 @@ def check_consistency(policy, cfg):
         dev = np.max(np.abs(u - clamp_control(policy.ref_controls[k], cfg)))
         max_dev = max(max_dev, dev)
         x = step_dynamics(x, u, cfg)
-        pos_dev = np.max(np.abs(x[:12] - policy.ref_traj[k + 1][:12]))
+        pos_dev = np.max(np.abs(x[:3] - policy.ref_traj[k + 1][:3]))
         max_dev = max(max_dev, pos_dev)
     return max_dev
 
@@ -633,7 +647,7 @@ def check_consistency(policy, cfg):
 # ======================================================================
 # Visualization
 # ======================================================================
-def draw_crazyflie(ax, pos, size=0.15, color_prop='#1a73e8'):
+def draw_crazyflie(ax, pos, size=0.15):
     cx, cy, cz = pos
     prop_r = size * 0.8
     arms = [np.array([1, 1, 0]) / np.sqrt(2), np.array([1, -1, 0]) / np.sqrt(2),
@@ -644,8 +658,8 @@ def draw_crazyflie(ax, pos, size=0.15, color_prop='#1a73e8'):
                 color='#333333', linewidth=2.5, zorder=10)
         theta = np.linspace(0, 2 * np.pi, 20)
         ax.plot(tip[0] + prop_r * np.cos(theta), tip[1] + prop_r * np.sin(theta),
-                np.full(20, tip[2]), color=color_prop, linewidth=1.5, alpha=0.8, zorder=10)
-    ax.scatter([cx], [cy], [cz], color=color_prop, s=40, zorder=11)
+                np.full(20, tip[2]), color='#1a73e8', linewidth=1.5, alpha=0.8, zorder=10)
+    ax.scatter([cx], [cy], [cz], color='#1a73e8', s=40, zorder=11)
 
 
 def draw_box_3d(ax, center, half_size, color='gray', alpha=0.3, edgecolor='black'):
@@ -674,16 +688,16 @@ def draw_sphere_3d(ax, center, radius, color='red', alpha=0.2):
 # ======================================================================
 def main():
     cfg = Config()
-    np.random.seed(42)
-    torch.manual_seed(42)
+    np.random.seed(123)
+    torch.manual_seed(123)
 
     print("=" * 70)
-    print("Policy Iteration via Rollout — Multi-Agent (2 Drones)")
+    print("Policy Iteration via Rollout — 3D Drone (Env 2)")
     print("=" * 70)
     print(f"N={cfg.N}, dt={cfg.dt}")
-    print(f"Drone 1: {cfg.x0_agent1[:3]} → goal {cfg.goal1_center}")
-    print(f"Drone 2: {cfg.x0_agent2[:3]} → goal {cfg.goal2_center}")
-    print(f"Obstacles: {len(OBSTACLES)} static + inter-agent repulsion")
+    print(f"Start: {cfg.x0[:3]}")
+    print(f"Goal region: center={cfg.goal_center}, half_size={cfg.goal_half_size}")
+    print(f"Obstacles: {len(OBSTACLES)} (box + sphere)")
     print()
 
     ppo_t0 = time.perf_counter()
@@ -775,18 +789,11 @@ def main():
               f"{all_rollout_times[i]:>10.2f} | {sm*1000:>6.1f}±{ss*1000:<5.1f} | "
               f"{all_nn_times[i]:>6.1f} | {cons:>9.2e}")
 
-    final_x = all_trajs[-1][-1]
-    p1f, p2f = final_x[0:3], final_x[6:9]
-    in_g1 = np.all(np.abs(p1f - cfg.goal1_center) <= cfg.goal_half_size)
-    in_g2 = np.all(np.abs(p2f - cfg.goal2_center) <= cfg.goal_half_size)
-    print(f"\nDrone 1 final: {np.round(p1f, 3)}, in_goal={in_g1}")
-    print(f"Drone 2 final: {np.round(p2f, 3)}, in_goal={in_g2}")
-
-    min_dist = float('inf')
-    for st in all_trajs[-1]:
-        d = np.linalg.norm(st[0:3] - st[6:9])
-        min_dist = min(min_dist, d)
-    print(f"Min inter-agent distance (final traj): {min_dist:.3f}")
+    final_pos = all_trajs[-1][-1][:3]
+    in_goal = np.all(np.abs(final_pos - cfg.goal_center) <= cfg.goal_half_size)
+    goal_dist = np.sqrt(goal_region_dist_sq(final_pos, cfg))
+    print(f"\nFinal: pos={np.round(final_pos, 3)}, in_goal={in_goal}, "
+          f"dist_to_boundary={goal_dist:.4f}")
 
     # ------------------------------------------------------------------
     # Plotting
@@ -808,61 +815,34 @@ def main():
         ax1.annotate(f"{c:.1f}", (i, c), textcoords="offset points",
                      xytext=(0, 8), ha='center', fontsize=18, color='#1a1a1a')
 
-    fig2 = plt.figure(figsize=(11, 8))
+    fig2 = plt.figure(figsize=(10, 7.5))
     ax2 = fig2.add_subplot(111, projection='3d')
 
     n_trajs = len(all_trajs)
     highlight_iter4 = min(4, n_trajs - 1)
     show_iters = sorted({0, highlight_iter4, n_trajs - 1})
 
-    # Drone identity: color, marker, goal box color (extensible to 3-4 drones)
-    agent_colors = ['#0b5394', '#0b8a8a', '#7b2d8e', '#8c564b']
-    agent_markers = ['^', 's', 'D', 'P']
-    agent_names = ['Drone 1', 'Drone 2']
-    goal_centers = [cfg.goal1_center, cfg.goal2_center]
-    n_agents = 2
-    agent_state_slices = [(0, 3, 6), (6, 9, 8)]  # (pos_start, vel_start_unused, col_start_for_arr)
-
-    # Iteration styles: Iter 0 = dashed, mid = solid thinner, final = solid thick
-    iter_palette = ['#ff7f0e', '#d62728', '#2ca02c', '#9467bd',
-                    '#8c564b', '#e377c2', '#17becf', '#bcbd22']
-    iter_colors = {}
-    iter_styles = {}
-    rank = 0
-    for i in show_iters:
+    for i, traj_i in enumerate(all_trajs):
+        if i not in show_iters:
+            continue
+        arr = np.array(traj_i)
         if i == 0:
-            iter_styles[i] = ('--', 2.0)
+            label = "Iter 0 (PPO)"
+            color, alpha, lw, ls = '#1f77b4', 0.95, 2.2, '--'
         elif i == n_trajs - 1:
-            iter_colors[i] = iter_palette[rank % len(iter_palette)]
-            iter_styles[i] = ('-', 3.0)
-            rank += 1
-        else:
-            iter_colors[i] = iter_palette[rank % len(iter_palette)]
-            iter_styles[i] = ('-', 2.4)
-            rank += 1
-
-    for i in show_iters:
-        arr = np.array(all_trajs[i])
-        ls, lw = iter_styles[i]
-        n_pts = len(arr)
-        mk_idx = [n_pts // 3, 2 * n_pts // 3]
-        for a in range(n_agents):
-            px = a * 6  # position index in joint state
-            col = agent_colors[a] if i == 0 else iter_colors[i]
-            ax2.plot(arr[:, px], arr[:, px+1], arr[:, px+2],
-                     color=col, linewidth=lw, linestyle=ls, alpha=0.95)
-            ax2.plot(arr[mk_idx, px], arr[mk_idx, px+1], arr[mk_idx, px+2],
-                     color=agent_colors[a], marker=agent_markers[a], markersize=8,
-                     linestyle='none', alpha=0.9,
-                     markeredgecolor='white', markeredgewidth=0.5)
+            label = f"Iter {i} (final)"
+            color, alpha, lw, ls = '#d62728', 1.0, 3.0, '-'
+        elif i == highlight_iter4:
+            label = f"Iter {i}"
+            color, alpha, lw, ls = '#ff7f0e', 0.95, 2.4, '-'
+        ax2.plot(arr[:, 0], arr[:, 1], arr[:, 2], color=color, alpha=alpha,
+                 linewidth=lw, linestyle=ls, label=label)
 
     final_arr = np.array(all_trajs[-1])
-    for a in range(n_agents):
-        px = a * 6
-        ax2.scatter(*final_arr[0, px:px+3], s=55, color=agent_colors[a],
-                    edgecolor='white', linewidth=0.8, zorder=12)
-        ax2.scatter(*final_arr[-1, px:px+3], s=85, marker='*',
-                    color=agent_colors[a], edgecolor='white', linewidth=0.8, zorder=13)
+    ax2.scatter(final_arr[0, 0], final_arr[0, 1], final_arr[0, 2], s=55,
+                color='#0b5394', edgecolor='white', linewidth=0.8, zorder=12)
+    ax2.scatter(final_arr[-1, 0], final_arr[-1, 1], final_arr[-1, 2], s=85, marker='*',
+                color='#c00000', edgecolor='white', linewidth=0.8, zorder=13)
 
     for obs in OBSTACLES:
         if isinstance(obs, BoxObstacle):
@@ -871,41 +851,15 @@ def main():
         elif isinstance(obs, SphereObstacle):
             draw_sphere_3d(ax2, obs.center, obs.radius, color='#e11d48', alpha=0.24)
 
-    for a in range(n_agents):
-        draw_box_3d(ax2, goal_centers[a], cfg.goal_half_size,
-                    color=agent_colors[a], alpha=0.22,
-                    edgecolor=agent_colors[a])
+    draw_box_3d(ax2, cfg.goal_center, cfg.goal_half_size,
+                color='#22c55e', alpha=0.30, edgecolor='#15803d')
+    draw_crazyflie(ax2, cfg.x0[:3], size=0.18)
 
-    for a in range(n_agents):
-        px = a * 6
-        draw_crazyflie(ax2, cfg.x0[px:px+3], size=0.18, color_prop=agent_colors[a])
-
-    # Legend: agent entries (marker + color) then iteration entries (line style)
-    from matplotlib.lines import Line2D
-    legend_handles = []
-    for a in range(n_agents):
-        legend_handles.append(Line2D([], [], color=agent_colors[a],
-                                     marker=agent_markers[a], markersize=9,
-                                     linestyle='-', linewidth=2.0,
-                                     markeredgecolor='white', markeredgewidth=0.5,
-                                     label=agent_names[a]))
-    legend_handles.append(Line2D([], [], color='#333333', linewidth=2.0,
-                                 linestyle='--', label='Iter 0 (PPO)'))
-    for i in show_iters:
-        if i == 0:
-            continue
-        ls, lw = iter_styles[i]
-        legend_handles.append(Line2D([], [], color=iter_colors[i], linewidth=lw,
-                                     linestyle=ls, label=f'Iter {i}'))
-    legend2 = ax2.legend(handles=legend_handles, fontsize=14, loc='upper right',
-                         framealpha=0.92)
-    legend2.set_draggable(True)
-
-    ax2.set_xlim(-3.0, 3.5)
-    ax2.set_ylim(-3.0, 3.5)
-    ax2.set_zlim(-1.0, 2.0)
-    ax2.set_box_aspect((1.0, 1.0, 0.55))
-    ax2.view_init(elev=26, azim=-55)
+    ax2.set_xlim(-3.2, 3.5)
+    ax2.set_ylim(-2.5, 2.5)
+    ax2.set_zlim(-0.5, 2.5)
+    ax2.set_box_aspect((1.0, 0.8, 0.55))
+    ax2.view_init(elev=28, azim=-52)
     ax2.set_xlabel("$X$", fontsize=24, labelpad=10)
     ax2.set_ylabel("$Y$", fontsize=24, labelpad=10)
     ax2.set_zlabel("$Z$", fontsize=24, labelpad=10)
@@ -919,11 +873,22 @@ def main():
         ax2.zaxis.pane.set_facecolor((0.96, 0.96, 0.96, 0.35))
     except Exception:
         pass
+    legend2 = ax2.legend(fontsize=20, loc='upper right', framealpha=0.92)
+    legend2.set_draggable(True)
 
     fig1.tight_layout()
     fig2.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99)
-    plt.show()
 
+    # # Always save figures to disk so they are accessible on Colab / headless runs. ---- uncomment for saving figures
+    # out_dir = os.environ.get("FIG_OUT_DIR", ".")
+    # os.makedirs(out_dir, exist_ok=True)
+    # fig1_path = os.path.join(out_dir, "one_drone_env2_cost.pdf")
+    # fig2_path = os.path.join(out_dir, "one_drone_env2_trajectory.pdf")
+    # fig1.savefig(fig1_path, dpi=150, bbox_inches="tight")
+    # fig2.savefig(fig2_path, dpi=150, bbox_inches="tight")
+    # print(f"[figures] saved:\n  {fig1_path}\n  {fig2_path}")
+
+    plt.show()
 
 if __name__ == "__main__":
     main()
