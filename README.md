@@ -19,7 +19,7 @@ On-line PI applied to plan paths for three drones. Starting with a path computed
 
 ## Path Planning for Robot Arm 
 
-![On-Line PI Arm](robot-arm/On_line_PI_panda_trajectory.gif)
+![On-Line PI Arm](robot-arm/panda_trajectory.gif)
 
-![On-Line PI Arm](robot-arm/On_line_PI_panda_trajectory_2.gif)
+![On-Line PI Arm](robot-arm/panda_trajectory_2.gif)
 On-line PI applied to plan paths for Robot Arm Panda from Robotics Toolbox for Python (https://github.com/petercorke/robotics-toolbox-python). Starting with a path computed via proximal policy optimization with cost 86.87, after 8 iterations, on-line PI converges has a cost 48.13. The animation here shown the trajectories under the initial policy, and the policies computed after 4th and 8th iterations.
