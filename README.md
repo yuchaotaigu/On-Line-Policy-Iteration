@@ -1,5 +1,5 @@
 # On-Line Policy Iteration with Trajectory-Driven Policy Generation
-Supplementary codes for 'On-Line Policy Iteration with Trajectory-Driven Policy Generation'
+Supplementary codes for 'On-Line Policy Iteration with Trajectory-Driven Policy Generation' by Y. Li, F. Chen, Y. Li, C. Fan, and D. Bertsekas. arXiv version: https://arxiv.org/abs/2604.15004
 
 ## Multidimensional Assignment (MDA) Problem 
 
