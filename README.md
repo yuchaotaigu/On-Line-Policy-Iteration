@@ -18,6 +18,7 @@ On-line PI applied to plan paths for three drones. Starting with a path computed
 
 
 ## Path Planning for Robot Arm 
+[![Powered by Python Robotics](https://raw.githubusercontent.com/petercorke/robotics-toolbox-python/master/.github/svg/pr_powered.min.svg)](https://github.com/petercorke/robotics-toolbox-python)
 
 ![On-Line PI Arm](robot-arm/panda_trajectory.gif)
 ![On-Line PI Arm](robot-arm/panda_trajectory_2.gif)
